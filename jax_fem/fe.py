@@ -16,6 +16,61 @@ onp.set_printoptions(threshold=sys.maxsize,
                      precision=5)
 
 
+def compute_shape_grads(np_mod, points, cells, shape_grads_ref, quad_weights):
+    """Compute shape function gradients in physical coordinates and JxW."""
+    physical_coos = np_mod.take(points, cells, axis=0)  # (num_cells, num_nodes, dim)
+    # (num_cells, num_quads, 1, dim, dim)
+    jacobian_dx_deta = np_mod.sum(physical_coos[:, None, :, :, None] *
+                                  shape_grads_ref[None, :, :, None, :], axis=2, keepdims=True)
+    jacobian_det = np_mod.linalg.det(jacobian_dx_deta)[:, :, 0]  # (num_cells, num_quads)
+    jacobian_deta_dx = np_mod.linalg.inv(jacobian_dx_deta)
+    # (num_cells, num_quads, num_nodes, dim)
+    shape_grads_physical = (shape_grads_ref[None, :, :, None, :]
+                            @ jacobian_deta_dx)[:, :, :, 0, :]
+    JxW = jacobian_det * quad_weights[None, :]
+    return shape_grads_physical, JxW
+
+
+def compute_physical_quad_points(np_mod, points, cells, shape_vals):
+    """Compute physical quadrature point coordinates."""
+    physical_coos = np_mod.take(points, cells, axis=0)
+    # (1, num_quads, num_nodes, 1) * (num_cells, 1, num_nodes, dim) -> (num_cells, num_quads, dim)
+    physical_quad_points = np_mod.sum(shape_vals[None, :, :, None] * physical_coos[:, None, :, :], axis=2)
+    return physical_quad_points
+
+
+def compute_face_shape_grads(np_mod, points, cells, boundary_inds, face_shape_grads_ref, face_normals, face_quad_weights):
+    """Compute face shape function gradients in physical coordinates and nanson_scale."""
+    physical_coos = np_mod.take(points, cells, axis=0)  # (num_cells, num_nodes, dim)
+    selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+    selected_f_shape_grads_ref = face_shape_grads_ref[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes, dim)
+    selected_f_normals = face_normals[boundary_inds[:, 1]]  # (num_selected_faces, dim)
+
+    # (num_selected_faces, num_face_quads, dim, dim)
+    jacobian_dx_deta = np_mod.sum(selected_coos[:, None, :, :, None] * selected_f_shape_grads_ref[:, :, :, None, :], axis=2)
+    jacobian_det = np_mod.linalg.det(jacobian_dx_deta)  # (num_selected_faces, num_face_quads)
+    jacobian_deta_dx = np_mod.linalg.inv(jacobian_dx_deta)  # (num_selected_faces, num_face_quads, dim, dim)
+
+    # (num_selected_faces, num_face_quads, num_nodes, dim)
+    face_shape_grads_physical = (selected_f_shape_grads_ref[:, :, :, None, :] @ jacobian_deta_dx[:, :, None, :, :])[:, :, :, 0, :]
+
+    # (num_selected_faces, num_face_quads)
+    nanson_scale = np_mod.linalg.norm((selected_f_normals[:, None, None, :] @ jacobian_deta_dx)[:, :, 0, :], axis=-1)
+    selected_weights = face_quad_weights[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads)
+    nanson_scale = nanson_scale * jacobian_det * selected_weights
+    return face_shape_grads_physical, nanson_scale
+
+
+def compute_physical_surface_quad_points(np_mod, points, cells, boundary_inds, face_shape_vals):
+    """Compute physical quadrature point coordinates on element faces."""
+    physical_coos = np_mod.take(points, cells, axis=0)
+    selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+    selected_face_shape_vals = face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+    # (num_selected_faces, num_face_quads, num_nodes, 1) * (num_selected_faces, 1, num_nodes, dim) -> (num_selected_faces, num_face_quads, dim)
+    physical_surface_quad_points = np_mod.sum(selected_face_shape_vals[:, :, :, None] * selected_coos[:, None, :, :], axis=2)
+    return physical_surface_quad_points
+
+
 @dataclass
 class FiniteElement:
     """Finite element class for one variable.
@@ -102,8 +157,8 @@ class FiniteElement:
     def get_shape_grads(self):
         """Compute shape function gradient value.
 
-        The gradient is w.r.t physical coordinates. 
-        Refer to 
+        The gradient is w.r.t physical coordinates.
+        Refer to
         Hughes, Thomas JR.
         The finite element method: linear static and dynamic finite element analysis. Courier Corporation, 2012.
         Page 147, Eq. (3.9.3)
@@ -115,26 +170,13 @@ class FiniteElement:
         JxW : NumpyArray
             Shape is (num_cells, num_quads).
         """
-        assert self.shape_grads_ref.shape == (self.num_quads, self.num_nodes, self.dim)
-        physical_coos = onp.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
-        # (num_cells, num_quads, num_nodes, dim, dim) -> (num_cells, num_quads, 1, dim, dim)
-        jacobian_dx_deta = onp.sum(physical_coos[:, None, :, :, None] *
-                                   self.shape_grads_ref[None, :, :, None, :], axis=2, keepdims=True)
-        jacobian_det = onp.linalg.det(jacobian_dx_deta)[:, :, 0]  # (num_cells, num_quads)
-        jacobian_deta_dx = onp.linalg.inv(jacobian_dx_deta)
-        # (1, num_quads, num_nodes, 1, dim) @ (num_cells, num_quads, 1, dim, dim)
-        # (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, dim)
-        shape_grads_physical = (self.shape_grads_ref[None, :, :, None, :]
-                                @ jacobian_deta_dx)[:, :, :, 0, :]
-        JxW = jacobian_det * self.quad_weights[None, :]
-        return shape_grads_physical, JxW
+        return compute_shape_grads(onp, self.points, self.cells, self.shape_grads_ref, self.quad_weights)
 
     def get_face_shape_grads(self, boundary_inds):
         """Face shape function gradients and JxW (for surface integral).
         Nanson's formula is used to map physical surface ingetral to reference domain.
-        Refer to 
+        Refer to
         `wikiversity <https://en.wikiversity.org/wiki/Continuum_mechanics/Volume_change_and_area_change>`_.
-
 
         Parameters
         ----------
@@ -148,27 +190,8 @@ class FiniteElement:
         nanson_scale : NumpyArray
             Shape is (num_selected_faces, num_face_quads).
         """
-        physical_coos = onp.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
-        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
-        selected_f_shape_grads_ref = self.face_shape_grads_ref[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes, dim)
-        selected_f_normals = self.face_normals[boundary_inds[:, 1]]  # (num_selected_faces, dim)
-
-        # (num_selected_faces, 1, num_nodes, dim, 1) * (num_selected_faces, num_face_quads, num_nodes, 1, dim)
-        # (num_selected_faces, num_face_quads, num_nodes, dim, dim) -> (num_selected_faces, num_face_quads, dim, dim)
-        jacobian_dx_deta = onp.sum(selected_coos[:, None, :, :, None] * selected_f_shape_grads_ref[:, :, :, None, :], axis=2)
-        jacobian_det = onp.linalg.det(jacobian_dx_deta)  # (num_selected_faces, num_face_quads)
-        jacobian_deta_dx = onp.linalg.inv(jacobian_dx_deta)  # (num_selected_faces, num_face_quads, dim, dim)
-
-        # (1, num_face_quads, num_nodes, 1, dim) @ (num_selected_faces, num_face_quads, 1, dim, dim)
-        # (num_selected_faces, num_face_quads, num_nodes, 1, dim) -> (num_selected_faces, num_face_quads, num_nodes, dim)
-        face_shape_grads_physical = (selected_f_shape_grads_ref[:, :, :, None, :] @ jacobian_deta_dx[:, :, None, :, :])[:, :, :, 0, :]
-
-        # (num_selected_faces, 1, 1, dim) @ (num_selected_faces, num_face_quads, dim, dim)
-        # (num_selected_faces, num_face_quads, 1, dim) -> (num_selected_faces, num_face_quads)
-        nanson_scale = onp.linalg.norm((selected_f_normals[:, None, None, :] @ jacobian_deta_dx)[:, :, 0, :], axis=-1)
-        selected_weights = self.face_quad_weights[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads)
-        nanson_scale = nanson_scale * jacobian_det * selected_weights
-        return face_shape_grads_physical, nanson_scale
+        return compute_face_shape_grads(onp, self.points, self.cells, boundary_inds,
+                                        self.face_shape_grads_ref, self.face_normals, self.face_quad_weights)
 
     def get_physical_quad_points(self):
         """Compute physical quadrature points
@@ -178,10 +201,7 @@ class FiniteElement:
         physical_quad_points : NumpyArray
             Shape is (num_cells, num_quads, dim).
         """
-        physical_coos = onp.take(self.points, self.cells, axis=0)
-        # (1, num_quads, num_nodes, 1) * (num_cells, 1, num_nodes, dim) -> (num_cells, num_quads, dim)
-        physical_quad_points = onp.sum(self.shape_vals[None, :, :, None] * physical_coos[:, None, :, :], axis=2)
-        return physical_quad_points
+        return compute_physical_quad_points(onp, self.points, self.cells, self.shape_vals)
 
     def get_physical_surface_quad_points(self, boundary_inds):
         """Compute physical quadrature points on the surface
@@ -196,12 +216,7 @@ class FiniteElement:
         physical_surface_quad_points : NumpyArray
             Shape for NumpyArray is (num_selected_faces, num_face_quads, dim).
         """
-        physical_coos = onp.take(self.points, self.cells, axis=0)
-        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
-        selected_face_shape_vals = self.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
-        # (num_selected_faces, num_face_quads, num_nodes, 1) * (num_selected_faces, 1, num_nodes, dim) -> (num_selected_faces, num_face_quads, dim)
-        physical_surface_quad_points = onp.sum(selected_face_shape_vals[:, :, :, None] * selected_coos[:, None, :, :], axis=2)
-        return physical_surface_quad_points
+        return compute_physical_surface_quad_points(onp, self.points, self.cells, boundary_inds, self.face_shape_vals)
 
     def Dirichlet_boundary_conditions(self, dirichlet_bc_info):
         """Indices and values for Dirichlet B.C.

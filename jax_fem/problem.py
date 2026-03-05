@@ -160,6 +160,72 @@ class Problem:
         self.custom_init(*self.additional_info)
         self.pre_jit_fns()
 
+    def recompute_geometry(self, points):
+        """Recompute all node-position-dependent geometric quantities using JAX.
+
+        Call this inside ``set_params()`` to make the FE solution differentiable
+        with respect to mesh node coordinates (shape sensitivity).
+
+        Parameters
+        ----------
+        points : jax.numpy.ndarray, shape (num_total_nodes, dim)
+            Updated node coordinates. Must have the same length as the
+            original mesh points.
+
+        Examples
+        --------
+        Typical usage in a shape-sensitivity problem::
+
+            class MyProblem(Problem):
+                def set_params(self, params):
+                    # params can be just coordinates, or a tuple including material fields
+                    points = params
+                    self.recompute_geometry(points)
+                    # Optionally also set material internal_vars:
+                    # self.internal_vars = [material_field]
+
+            # Usage:
+            fwd_pred = ad_wrapper(problem, solver_options, adjoint_solver_options)
+            sol_list = fwd_pred(initial_points)
+            # sol_list is now differentiable w.r.t. initial_points
+        """
+        from jax_fem.fe import (compute_shape_grads, compute_physical_quad_points,
+                                compute_face_shape_grads, compute_physical_surface_quad_points)
+
+        fe_shape_grads = []
+        fe_JxW = []
+        fe_v_grads_JxW = []
+        for fe in self.fes:
+            sg, jxw = compute_shape_grads(np, points, fe.cells,
+                                          fe.shape_grads_ref, fe.quad_weights)
+            vgj = sg[:, :, :, None, :] * jxw[:, :, None, None, None]
+            fe_shape_grads.append(sg)
+            fe_JxW.append(jxw)
+            fe_v_grads_JxW.append(vgj)
+
+        self.JxW = np.transpose(np.stack(fe_JxW), axes=(1, 0, 2))
+        self.shape_grads = np.concatenate(fe_shape_grads, axis=2)
+        self.v_grads_JxW = np.concatenate(fe_v_grads_JxW, axis=2)
+        self.physical_quad_points = compute_physical_quad_points(
+            np, points, self.fes[0].cells, self.fes[0].shape_vals)
+
+        for i, boundary_inds in enumerate(self.boundary_inds_list):
+            s_shape_grads = []
+            n_scale = []
+            for fe in self.fes:
+                fsg, ns = compute_face_shape_grads(
+                    np, points, fe.cells, boundary_inds,
+                    fe.face_shape_grads_ref, fe.face_normals,
+                    fe.face_quad_weights)
+                s_shape_grads.append(fsg)
+                n_scale.append(ns)
+
+            self.selected_face_shape_grads[i] = np.concatenate(s_shape_grads, axis=2)
+            self.nanson_scale[i] = np.transpose(np.stack(n_scale), axes=(1, 0, 2))
+            self.physical_surface_quad_points[i] = compute_physical_surface_quad_points(
+                np, points, self.fes[0].cells, boundary_inds,
+                self.fes[0].face_shape_vals)
+
     def custom_init(self):
         """Child class should override if more things need to be done in initialization
         """
